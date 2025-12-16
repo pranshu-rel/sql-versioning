@@ -118,46 +118,52 @@ async function saveVersion(procedureName, definitionText, definitionHash) {
 }
 
 /**
- * Sync a procedure: detect changes, version, and update if needed
+ * Sync a procedure: detect changes by comparing DB and local file, version, and update if needed
  */
 async function syncProcedure(procName, sqlFile) {
   const sqlPath = path.join(__dirname, "..", "procedures", sqlFile);
   const sql = fs.readFileSync(sqlPath, "utf8");
 
-  // Extract the actual procedure definition
-  const newDefinition = extractProcedureDefinition(sql);
-  const normalizedNew = normalizeDefinition(newDefinition);
-  const newHash = calculateHash(normalizedNew);
+  // Extract the actual procedure definition from local file
+  const localDefinition = extractProcedureDefinition(sql);
+  const normalizedLocal = normalizeDefinition(localDefinition);
+  const localHash = calculateHash(normalizedLocal);
 
+  // Get current definition from database
   const exists = await procedureExists(procName);
-  let currentDefinition = null;
-  let currentHash = null;
+  let dbDefinition = null;
+  let dbHash = null;
+  let hasChanged = false;
 
   if (exists) {
-    // Get current definition from database
-    currentDefinition = await getCurrentProcedureDefinition(procName);
-    if (currentDefinition) {
-      const normalizedCurrent = normalizeDefinition(currentDefinition);
-      currentHash = calculateHash(normalizedCurrent);
+    // Get actual procedure definition from database
+    dbDefinition = await getCurrentProcedureDefinition(procName);
+    if (dbDefinition) {
+      const normalizedDb = normalizeDefinition(dbDefinition);
+      dbHash = calculateHash(normalizedDb);
+      // Compare database definition with local file definition
+      hasChanged = dbHash !== localHash;
+    } else {
+      // Procedure exists but we couldn't get its definition - treat as changed
+      hasChanged = true;
     }
+  } else {
+    // Procedure doesn't exist in database - needs to be created
+    hasChanged = true;
   }
-
-  // Check if procedure has changed
-  const latestVersion = await getLatestVersion(procName);
-  const hasChanged = !latestVersion || latestVersion.definition_hash !== newHash;
 
   if (hasChanged) {
     // Apply the procedure change
     console.log(
       exists
-        ? `♻️ Updating procedure: ${procName}`
-        : `🆕 Creating procedure: ${procName}`
+        ? `♻️ Updating procedure: ${procName} (DB definition differs from local file)`
+        : `🆕 Creating procedure: ${procName} (not found in database)`
     );
 
     await db.query(sql);
 
     // Save new version
-    const version = await saveVersion(procName, newDefinition, newHash);
+    const version = await saveVersion(procName, localDefinition, localHash);
     console.log(`✅ Procedure synced: ${procName} (version ${version})`);
     
     return {
@@ -167,56 +173,17 @@ async function syncProcedure(procName, sqlFile) {
       changed: true
     };
   } else {
-    console.log(`✓ Procedure unchanged: ${procName} (version ${latestVersion.version})`);
+    // Procedure unchanged - get version for return value
+    const latestVersion = await getLatestVersion(procName);
+    const version = latestVersion ? latestVersion.version : null;
+    console.log(`✓ Procedure unchanged: ${procName} (DB matches local file${version ? `, version ${version}` : ''})`);
     return {
       success: true,
       action: "unchanged",
-      version: latestVersion.version,
+      version: version,
       changed: false
     };
   }
-}
-
-/**
- * Get all versions of a procedure
- */
-async function getProcedureVersions(procedureName) {
-  const [rows] = await db.query(
-    `SELECT id, version, definition_hash, definition_text, created_at, updated_at
-     FROM procedure_versions
-     WHERE procedure_name = ?
-     ORDER BY version DESC`,
-    [procedureName]
-  );
-  return rows;
-}
-
-/**
- * Get all procedures with their latest versions
- */
-async function getAllProcedures() {
-  const [rows] = await db.query(
-    `SELECT 
-       pv.procedure_name,
-       pv.version as latest_version,
-       pv.definition_hash,
-       pv.created_at,
-       pv.updated_at,
-       CASE WHEN r.ROUTINE_NAME IS NOT NULL THEN 1 ELSE 0 END as exists_in_db
-     FROM (
-       SELECT procedure_name, MAX(version) as max_version
-       FROM procedure_versions
-       GROUP BY procedure_name
-     ) latest
-     INNER JOIN procedure_versions pv 
-       ON pv.procedure_name = latest.procedure_name 
-       AND pv.version = latest.max_version
-     LEFT JOIN information_schema.ROUTINES r
-       ON r.ROUTINE_SCHEMA = DATABASE()
-       AND r.ROUTINE_TYPE = 'PROCEDURE'
-       AND r.ROUTINE_NAME = pv.procedure_name`
-  );
-  return rows;
 }
 
 /**
@@ -260,7 +227,5 @@ async function syncAllProcedures() {
 
 module.exports = {
   syncProcedure,
-  getProcedureVersions,
-  getAllProcedures,
   syncAllProcedures
 };
